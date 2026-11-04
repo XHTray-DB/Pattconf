@@ -1,0 +1,41 @@
+name: Update conf2.json
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - subs.txt
+      - scripts/build_conf2.py
+      - .github/workflows/update-conf2.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-conf2
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test the servers and build conf2.json
+        run: python3 scripts/build_conf2.py
+
+      - name: Commit conf2.json when it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add conf2.json
+          if git diff --cached --quiet; then
+            echo "conf2.json unchanged"
+          else
+            git commit -m "Update conf2.json"
+            git pull --rebase
+            git push
+          fi
