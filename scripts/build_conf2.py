@@ -35,7 +35,7 @@ TIMEOUT = float(os.environ.get("TIMEOUT", "4"))
 ATTEMPTS = int(os.environ.get("ATTEMPTS", "3"))
 MIN_OK = int(os.environ.get("MIN_OK", "2"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "200"))
-MAX_PER_SUB = int(os.environ.get("MAX_PER_SUB", "100"))
+MAX_PER_SUB = int(os.environ.get("MAX_PER_SUB", "2000"))
 INCLUDE_UDP = os.environ.get("INCLUDE_UDP", "false").lower() in ("1", "true", "yes")
 
 TCP_SCHEMES = ("vless", "vmess", "trojan", "ss")
