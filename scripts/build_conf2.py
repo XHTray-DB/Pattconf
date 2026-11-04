@@ -14,19 +14,28 @@ Settings come from environment variables, all optional:
   CONCURRENCY    servers tested at the same time             (200)
   MAX_PER_SUB    most links kept from one subscription       (100)
   INCLUDE_UDP    keep hysteria2/hy2/wireguard links, which a TCP test cannot check (false)
+  GEO_API_URL    batch address-to-country service            (http://ip-api.com/batch?fields=status,countryCode,query)
+  GEO_DB_URL     fallback table of address ranges, .csv or .csv.gz (db-ip.com's free country file of this month)
+
+Each kept link is renamed to the flag and the Persian name of the country its server is in, whatever name it had.
 """
 import asyncio
 import base64
 import binascii
+import bisect
+import gzip
+import ipaddress
 import json
 import os
 import re
+import socket
 import statistics
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SUBS_FILE = Path(os.environ.get("SUBS_FILE", "subs.txt"))
@@ -35,8 +44,41 @@ TIMEOUT = float(os.environ.get("TIMEOUT", "4"))
 ATTEMPTS = int(os.environ.get("ATTEMPTS", "3"))
 MIN_OK = int(os.environ.get("MIN_OK", "2"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "200"))
-MAX_PER_SUB = int(os.environ.get("MAX_PER_SUB", "2000"))
+MAX_PER_SUB = int(os.environ.get("MAX_PER_SUB", "100"))
 INCLUDE_UDP = os.environ.get("INCLUDE_UDP", "false").lower() in ("1", "true", "yes")
+GEO_API_URL = os.environ.get("GEO_API_URL", "http://ip-api.com/batch?fields=status,countryCode,query")
+GEO_DB_URL = os.environ.get("GEO_DB_URL", "")
+UNKNOWN_NAME = "\U0001F3F3\ufe0f نامشخص"
+
+COUNTRY_NAMES = dict(
+    pair.split(":", 1)
+    for pair in """AD:آندورا AE:امارات AF:افغانستان AG:آنتیگوا_و_باربودا AI:آنگویلا AL:آلبانی AM:ارمنستان AO:آنگولا AR:آرژانتین
+AS:ساموآی_آمریکا AT:اتریش AU:استرالیا AW:آروبا AX:جزایر_آلند AZ:جمهوری_آذربایجان BA:بوسنی_و_هرزگوین BB:باربادوس
+BD:بنگلادش BE:بلژیک BF:بورکینافاسو BG:بلغارستان BH:بحرین BI:بوروندی BJ:بنین BL:سنت_بارتلمی BM:برمودا BN:برونئی
+BO:بولیوی BQ:کارائیب_هلند BR:برزیل BS:باهاما BT:بوتان BW:بوتسوانا BY:بلاروس BZ:بلیز CA:کانادا CC:جزایر_کوکوس
+CD:کنگو_کینشاسا CF:آفریقای_مرکزی CG:کنگو_برازاویل CH:سوئیس CI:ساحل_عاج CK:جزایر_کوک CL:شیلی CM:کامرون CN:چین
+CO:کلمبیا CR:کاستاریکا CU:کوبا CV:کیپ_ورد CW:کوراسائو CX:جزیره_کریسمس CY:قبرس CZ:چک DE:آلمان DJ:جیبوتی DK:دانمارک
+DM:دومینیکا DO:جمهوری_دومینیکن DZ:الجزایر EC:اکوادور EE:استونی EG:مصر EH:صحرای_غربی ER:اریتره ES:اسپانیا
+ET:اتیوپی FI:فنلاند FJ:فیجی FK:جزایر_فالکلند FM:میکرونزی FO:جزایر_فارو FR:فرانسه GA:گابن GB:بریتانیا GD:گرنادا
+GE:گرجستان GF:گویان_فرانسه GG:گرنزی GH:غنا GI:جبل_الطارق GL:گرینلند GM:گامبیا GN:گینه GP:گوادلوپ GQ:گینه_استوایی
+GR:یونان GT:گواتمالا GU:گوام GW:گینه_بیسائو GY:گویان HK:هنگ_کنگ HN:هندوراس HR:کرواسی HT:هائیتی HU:مجارستان
+ID:اندونزی IE:ایرلند IL:اسرائیل IM:جزیره_من IN:هند IO:قلمرو_اقیانوس_هند_بریتانیا IQ:عراق IR:ایران IS:ایسلند
+IT:ایتالیا JE:جرسی JM:جامائیکا JO:اردن JP:ژاپن KE:کنیا KG:قرقیزستان KH:کامبوج KI:کیریباتی KM:کومور
+KN:سنت_کیتس_و_نویس KP:کره_شمالی KR:کره_جنوبی KW:کویت KY:جزایر_کیمن KZ:قزاقستان LA:لائوس LB:لبنان LC:سنت_لوسیا
+LI:لیختن_اشتاین LK:سری_لانکا LR:لیبریا LS:لسوتو LT:لیتوانی LU:لوکزامبورگ LV:لتونی LY:لیبی MA:مراکش MC:موناکو
+MD:مولداوی ME:مونته_نگرو MF:سنت_مارتین MG:ماداگاسکار MH:جزایر_مارشال MK:مقدونیه_شمالی ML:مالی MM:میانمار
+MN:مغولستان MO:ماکائو MP:ماریانای_شمالی MQ:مارتینیک MR:موریتانی MS:مونتسرات MT:مالت MU:موریس MV:مالدیو MW:مالاوی
+MX:مکزیک MY:مالزی MZ:موزامبیک NA:نامیبیا NC:کالدونیای_جدید NE:نیجر NF:جزیره_نورفولک NG:نیجریه NI:نیکاراگوئه
+NL:هلند NO:نروژ NP:نپال NR:نائورو NU:نیوئه NZ:نیوزیلند OM:عمان PA:پاناما PE:پرو PF:پلی_نزی_فرانسه PG:پاپوآ_گینه_نو
+PH:فیلیپین PK:پاکستان PL:لهستان PM:سن_پیر_و_میکلن PR:پورتوریکو PS:فلسطین PT:پرتغال PW:پالائو PY:پاراگوئه
+QA:قطر RE:رئونیون RO:رومانی RS:صربستان RU:روسیه RW:رواندا SA:عربستان_سعودی SB:جزایر_سلیمان SC:سیشل SD:سودان
+SE:سوئد SG:سنگاپور SH:سنت_هلنا SI:اسلوونی SJ:سوالبارد SK:اسلواکی SL:سیرالئون SM:سن_مارینو SN:سنگال SO:سومالی
+SR:سورینام SS:سودان_جنوبی ST:سائوتومه_و_پرنسیپ SV:السالوادور SX:سنت_مارتن SY:سوریه SZ:اسواتینی
+TC:تورکس_و_کایکوس TD:چاد TG:توگو TH:تایلند TJ:تاجیکستان TK:توکلائو TL:تیمور_شرقی TM:ترکمنستان TN:تونس TO:تونگا
+TR:ترکیه TT:ترینیداد_و_توباگو TV:تووالو TW:تایوان TZ:تانزانیا UA:اوکراین UG:اوگاندا US:آمریکا UY:اروگوئه
+UZ:ازبکستان VA:واتیکان VC:سنت_وینسنت VE:ونزوئلا VG:ویرجین_بریتانیا VI:ویرجین_آمریکا VN:ویتنام VU:وانواتو
+WF:والیس_و_فوتونا WS:ساموآ XK:کوزوو YE:یمن YT:مایوت ZA:آفریقای_جنوبی ZM:زامبیا ZW:زیمبابوه""".split()
+)
 
 TCP_SCHEMES = ("vless", "vmess", "trojan", "ss")
 UDP_SCHEMES = ("hysteria2", "hy2", "wireguard")
@@ -113,10 +155,10 @@ def key_of(link):
     return link.split("#", 1)[0]
 
 
-async def probe(host, port):
+async def probe(address, port):
     started = time.perf_counter()
     try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), TIMEOUT)
+        _, writer = await asyncio.wait_for(asyncio.open_connection(address, port), TIMEOUT)
     except Exception:
         return None
     elapsed = (time.perf_counter() - started) * 1000
@@ -129,14 +171,21 @@ async def probe(host, port):
 
 
 async def tcping(host, port, gate):
+    """(median milliseconds, the address that was tested) when the server answers, else None."""
     async with gate:
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception:
+            return None
+        # One address is tested and remembered, so the country below is that of the server that was tested.
+        address = sorted(infos, key=lambda info: info[0] != socket.AF_INET)[0][4][0]
         answers = []
         for _ in range(ATTEMPTS):
-            ms = await probe(host, port)
+            ms = await probe(address, port)
             if ms is not None:
                 answers.append(ms)
             await asyncio.sleep(0.2)
-        return statistics.median(answers) if len(answers) >= MIN_OK else None
+        return (statistics.median(answers), address) if len(answers) >= MIN_OK else None
 
 
 async def test_all(endpoints):
@@ -144,6 +193,129 @@ async def test_all(endpoints):
     ordered = list(endpoints)
     results = await asyncio.gather(*(tcping(h, p, gate) for h, p in ordered))
     return dict(zip(ordered, results))
+
+
+def http_get_bytes(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (conf2-builder)"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return response.read()
+
+
+def geo_batch(addresses):
+    """Country code by address from a batch service (100 addresses a call, 15 calls a minute)."""
+    found = {}
+    addresses = sorted(addresses)
+    for start in range(0, len(addresses), 100):
+        chunk = addresses[start:start + 100]
+        data = []
+        for _ in range(3):
+            try:
+                request = urllib.request.Request(
+                    GEO_API_URL,
+                    data=json.dumps(chunk).encode(),
+                    headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (conf2-builder)"},
+                )
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = json.loads(response.read().decode())
+                    if response.headers.get("X-Rl") == "0":
+                        time.sleep(int(response.headers.get("X-Ttl") or 5) + 1)
+                break
+            except urllib.error.HTTPError as error:
+                if error.code == 429:
+                    time.sleep(int(error.headers.get("X-Ttl") or 60) + 1)
+                    continue
+                break
+            except Exception:
+                time.sleep(3)
+        for item in data:
+            if item.get("status") == "success" and item.get("countryCode"):
+                found[item["query"]] = item["countryCode"].upper()
+        if start + 100 < len(addresses):
+            time.sleep(4.5)
+    return found
+
+
+def geo_table():
+    """The fallback table: sorted address ranges with their country, for both address families."""
+    if GEO_DB_URL:
+        urls = [GEO_DB_URL]
+    else:
+        now = datetime.now(timezone.utc)
+        last = (now.replace(day=1) - timedelta(days=1))
+        urls = [f"https://download.db-ip.com/free/dbip-country-lite-{d.year}-{d.month:02d}.csv.gz" for d in (now, last)]
+    for url in urls:
+        try:
+            raw = http_get_bytes(url)
+            if raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            tables = {4: ([], [], []), 6: ([], [], [])}
+            for line in raw.decode("utf-8", errors="replace").splitlines():
+                parts = line.strip().split(",")
+                if len(parts) < 3:
+                    continue
+                first = ipaddress.ip_address(parts[0].strip('"'))
+                last_ip = ipaddress.ip_address(parts[1].strip('"'))
+                starts, ends, codes = tables[first.version]
+                starts.append(int(first))
+                ends.append(int(last_ip))
+                codes.append(parts[2].strip('"').upper())
+            return tables
+        except Exception as error:
+            log(f"! address table not read from {url}: {error}")
+    return None
+
+
+def country_codes(addresses):
+    """Country code by address: the batch service first, the address table for what it did not answer."""
+    found = geo_batch(addresses) if addresses else {}
+    missing = [a for a in addresses if a not in found]
+    if missing:
+        table = geo_table()
+        for address in missing:
+            try:
+                value = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if table is None:
+                break
+            starts, ends, codes = table[value.version]
+            index = bisect.bisect_right(starts, int(value)) - 1
+            if index >= 0 and int(value) <= ends[index] and len(codes[index]) == 2 and codes[index].isalpha():
+                found[address] = codes[index]
+    return found
+
+
+def address_of(host):
+    """An address of a host that was not tested (the UDP links), or None."""
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        return sorted(infos, key=lambda info: info[0] != socket.AF_INET)[0][4][0]
+    except Exception:
+        return None
+
+
+def flag_of(code):
+    return "".join(chr(0x1F1E6 + ord(c) - 65) for c in code)
+
+
+def title_of(code):
+    if not code:
+        return UNKNOWN_NAME
+    return f"{flag_of(code)} {COUNTRY_NAMES.get(code, code).replace('_', ' ')}"
+
+
+def rename(link, title):
+    """The link with its name replaced by [title], whatever name it had."""
+    if link.lower().startswith("vmess://"):
+        try:
+            payload = re.split(r"[?#]", link[len("vmess://"):], maxsplit=1)[0]
+            data = json.loads(b64decode(payload))
+            data["ps"] = title
+            body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            return "vmess://" + base64.b64encode(body).decode()
+        except Exception:
+            pass
+    return link.split("#", 1)[0] + "#" + urllib.parse.quote(title, safe="")
 
 
 def read_subs():
@@ -196,18 +368,23 @@ def main():
     results = asyncio.run(test_all(tcp_endpoints))
     log(f"tested in {time.time() - started:.0f}s, {sum(v is not None for v in results.values())} answered")
 
-    kept = []
+    chosen = []  # (link, address of the server)
     for url, items in per_sub:
         alive = [
-            link
+            (link, results[ep][1] if results.get(ep) else address_of(ep[0]))
             for link, ep in items
             if link.split("://", 1)[0].lower() in UDP_SCHEMES or results.get(ep) is not None
         ][:MAX_PER_SUB]
         log(f"{url}: {len(alive)} of {len(items)} kept")
-        kept.extend(alive)
+        chosen.extend(alive)
 
-    if not kept:
+    if not chosen:
         sys.exit("no server answered; conf2.json is left as it was")
+
+    addresses = {address for _, address in chosen if address}
+    countries = country_codes(sorted(addresses))
+    log(f"country found for {len(countries)} of {len(addresses)} addresses")
+    kept = [rename(link, title_of(countries.get(address))) for link, address in chosen]
 
     previous = []
     if OUTPUT.exists():
