@@ -25,6 +25,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Test the servers and build conf2.json
+        env:
+          V2GET_API_URL: ${{ vars.V2GET_API_URL }}
+          V2GET_ADMIN_SECRET: ${{ secrets.V2GET_ADMIN_SECRET }}
         run: python3 scripts/build_conf2.py
 
       - name: Commit conf2.json when it changed
