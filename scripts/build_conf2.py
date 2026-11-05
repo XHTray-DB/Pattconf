@@ -12,7 +12,7 @@ Settings come from environment variables, all optional:
   ATTEMPTS       connections tried per server                (3)
   MIN_OK         how many of them must answer                (2)
   CONCURRENCY    servers tested at the same time             (200)
-  MAX_PER_SUB    most links kept from one subscription       (100)
+  MAX_PER_COUNTRY  most links kept from one country; the countries are mixed in the file (10)
   INCLUDE_UDP    keep hysteria2/hy2/wireguard links, which a TCP test cannot check (false)
   GEO_API_URL    batch address-to-country service            (http://ip-api.com/batch?fields=status,countryCode,query)
   V2GET_API_URL, V2GET_ADMIN_SECRET   the panel; servers most accounts could not connect to are left out (skipped when unset)
@@ -46,7 +46,7 @@ TIMEOUT = float(os.environ.get("TIMEOUT", "4"))
 ATTEMPTS = int(os.environ.get("ATTEMPTS", "3"))
 MIN_OK = int(os.environ.get("MIN_OK", "2"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "200"))
-MAX_PER_SUB = int(os.environ.get("MAX_PER_SUB", "100"))
+MAX_PER_COUNTRY = int(os.environ.get("MAX_PER_COUNTRY", "10"))
 INCLUDE_UDP = os.environ.get("INCLUDE_UDP", "false").lower() in ("1", "true", "yes")
 GEO_API_URL = os.environ.get("GEO_API_URL", "http://ip-api.com/batch?fields=status,countryCode,query")
 GEO_DB_URL = os.environ.get("GEO_DB_URL", "")
@@ -343,6 +343,24 @@ def bad_keys():
         return set()
 
 
+def spread(chosen, countries):
+    """At most MAX_PER_COUNTRY of each country, in source order, then mixed: one of each country in turn, the
+    countries with the most servers first, so no country fills the top of the list."""
+    groups = {}
+    for link, address in chosen:
+        group = groups.setdefault(countries.get(address) or "", [])
+        if len(group) < MAX_PER_COUNTRY:
+            group.append((link, address))
+    order = sorted(groups, key=lambda code: (-len(groups[code]), code))
+    log("per country: " + ", ".join(f"{code or '??'}={len(groups[code])}" for code in order))
+    mixed = []
+    for turn in range(MAX_PER_COUNTRY):
+        for code in order:
+            if turn < len(groups[code]):
+                mixed.append(groups[code][turn])
+    return mixed
+
+
 def read_subs():
     if not SUBS_FILE.exists():
         sys.exit(f"{SUBS_FILE} not found")
@@ -399,8 +417,8 @@ def main():
             (link, results[ep][1] if results.get(ep) else address_of(ep[0]))
             for link, ep in items
             if link.split("://", 1)[0].lower() in UDP_SCHEMES or results.get(ep) is not None
-        ][:MAX_PER_SUB]
-        log(f"{url}: {len(alive)} of {len(items)} kept")
+        ]
+        log(f"{url}: {len(alive)} of {len(items)} answered")
         chosen.extend(alive)
 
     if not chosen:
@@ -409,6 +427,7 @@ def main():
     addresses = {address for _, address in chosen if address}
     countries = country_codes(sorted(addresses))
     log(f"country found for {len(countries)} of {len(addresses)} addresses")
+    chosen = spread(chosen, countries)
     kept = [rename(link, title_of(countries.get(address))) for link, address in chosen]
 
     bad = bad_keys()
