@@ -18,6 +18,11 @@ Settings come from environment variables, all optional:
   V2GET_API_URL, V2GET_ADMIN_SECRET   the panel; servers most accounts could not connect to are left out (skipped when unset)
   GEO_DB_URL     fallback table of address ranges, .csv or .csv.gz (db-ip.com's free country file of this month)
 
+Every run starts from the servers of the previous conf2.json: they are tested again, the ones that still answer are
+kept, the dead ones are dropped, and new servers from the subscriptions take their place until TARGET_COUNT is reached.
+
+  TARGET_COUNT   how many links conf2.json should hold (200)
+
 Each kept link is renamed to the flag and the Persian name of the country its server is in, whatever name it had.
 """
 import asyncio
@@ -47,6 +52,7 @@ ATTEMPTS = int(os.environ.get("ATTEMPTS", "3"))
 MIN_OK = int(os.environ.get("MIN_OK", "2"))
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "200"))
 MAX_PER_COUNTRY = int(os.environ.get("MAX_PER_COUNTRY", "15"))
+TARGET_COUNT = int(os.environ.get("TARGET_COUNT", "200"))
 INCLUDE_UDP = os.environ.get("INCLUDE_UDP", "false").lower() in ("1", "true", "yes")
 GEO_API_URL = os.environ.get("GEO_API_URL", "http://ip-api.com/batch?fields=status,countryCode,query")
 GEO_DB_URL = os.environ.get("GEO_DB_URL", "")
@@ -153,7 +159,15 @@ def endpoint(link):
 
 
 def key_of(link):
-    """Two links that differ only in their name are one server."""
+    """Two links that differ only in their name are one server (a vmess link keeps its name inside its body)."""
+    if link.lower().startswith("vmess://"):
+        try:
+            payload = re.split(r"[?#]", link[len("vmess://"):], maxsplit=1)[0]
+            data = json.loads(b64decode(payload))
+            data.pop("ps", None)
+            return "vmess://" + json.dumps(data, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            pass
     return link.split("#", 1)[0]
 
 
@@ -343,18 +357,38 @@ def bad_keys():
         return set()
 
 
-def spread(chosen, countries):
-    """At most MAX_PER_COUNTRY of each country, in source order, then mixed: one of each country in turn, the
-    countries with the most servers first, so no country fills the top of the list."""
+def select_and_mix(keepers, fresh, target):
+    """Up to [target] candidates, (link, address, country, ms): the kept ones first, then the new ones, the fastest
+    first, with at most MAX_PER_COUNTRY of a country; when that leaves the list short, the cap is lifted for the
+    rest. The result is mixed: one of each country in turn, the countries with the most servers first."""
     groups = {}
-    for link, address in chosen:
-        group = groups.setdefault(countries.get(address) or "", [])
-        if len(group) < MAX_PER_COUNTRY:
-            group.append((link, address))
+    taken = set()
+    total = 0
+
+    def add(item, capped):
+        nonlocal total
+        link, _, country, _ = item
+        if total >= target or link in taken:
+            return
+        group = groups.setdefault(country or "", [])
+        if capped and len(group) >= MAX_PER_COUNTRY:
+            return
+        group.append(item)
+        taken.add(link)
+        total += 1
+
+    ordered_keepers = sorted(keepers, key=lambda item: item[3])
+    ordered_fresh = sorted(fresh, key=lambda item: item[3])
+    for item in ordered_keepers + ordered_fresh:
+        add(item, capped=True)
+    if total < target:
+        log(f"only {total} of {target} within {MAX_PER_COUNTRY} per country; lifting the cap for the rest")
+        for item in ordered_keepers + ordered_fresh:
+            add(item, capped=False)
     order = sorted(groups, key=lambda code: (-len(groups[code]), code))
     log("per country: " + ", ".join(f"{code or '??'}={len(groups[code])}" for code in order))
     mixed = []
-    for turn in range(MAX_PER_COUNTRY):
+    for turn in range(max((len(g) for g in groups.values()), default=0)):
         for code in order:
             if turn < len(groups[code]):
                 mixed.append(groups[code][turn])
@@ -372,12 +406,35 @@ def read_subs():
     return urls
 
 
+def load_previous():
+    """The links of the previous OUTPUT, or an empty list."""
+    if not OUTPUT.exists():
+        return []
+    try:
+        return json.loads(OUTPUT.read_text(encoding="utf-8")).get("configs", [])
+    except Exception:
+        return []
+
+
 def main():
     subs = read_subs()
     if not subs:
         sys.exit("subs.txt holds no subscription link")
 
+    # The servers of the last run are tested again first: the ones that still answer stay.
+    previous = load_previous()
     seen = set()
+    prev_items = []  # (link, endpoint)
+    for link in previous:
+        key = key_of(link)
+        scheme = link.split("://", 1)[0].lower()
+        ep = endpoint(link)
+        if key in seen or ep is None or (scheme in UDP_SCHEMES and not INCLUDE_UDP):
+            continue
+        seen.add(key)
+        prev_items.append((link, ep))
+    log(f"previous run: {len(previous)} links, {len(prev_items)} to test again")
+
     per_sub = []  # (url, [(link, endpoint)])
     for url in subs:
         try:
@@ -403,56 +460,78 @@ def main():
         per_sub.append((url, fresh))
 
     # UDP links cannot be checked with a TCP connection: they are kept as they are when INCLUDE_UDP is on.
-    tcp_endpoints = {
-        ep for _, items in per_sub for link, ep in items if link.split("://", 1)[0].lower() in TCP_SCHEMES
-    }
+    def is_udp(link):
+        return link.split("://", 1)[0].lower() in UDP_SCHEMES
+
+    tcp_endpoints = {ep for link, ep in prev_items if not is_udp(link)}
+    tcp_endpoints |= {ep for _, items in per_sub for link, ep in items if not is_udp(link)}
     log(f"testing {len(tcp_endpoints)} servers ({ATTEMPTS} tries each, {MIN_OK} must answer)...")
     started = time.time()
     results = asyncio.run(test_all(tcp_endpoints))
     log(f"tested in {time.time() - started:.0f}s, {sum(v is not None for v in results.values())} answered")
 
-    chosen = []  # (link, address of the server)
-    for url, items in per_sub:
-        alive = [
-            (link, results[ep][1] if results.get(ep) else address_of(ep[0]))
-            for link, ep in items
-            if link.split("://", 1)[0].lower() in UDP_SCHEMES or results.get(ep) is not None
-        ]
-        log(f"{url}: {len(alive)} of {len(items)} answered")
-        chosen.extend(alive)
+    def alive_of(items):
+        out = []  # (link, address, ms)
+        for link, ep in items:
+            result = results.get(ep)
+            if result is not None:
+                out.append((link, result[1], result[0]))
+            elif is_udp(link):
+                out.append((link, address_of(ep[0]), 0.0))
+        return out
 
-    if not chosen:
+    kept_old = alive_of(prev_items)
+    log(f"previous servers: {len(kept_old)} of {len(prev_items)} still answer, {len(prev_items) - len(kept_old)} dropped")
+    new_alive = []
+    for url, items in per_sub:
+        alive = alive_of(items)
+        log(f"{url}: {len(alive)} of {len(items)} answered")
+        new_alive.extend(alive)
+
+    if not kept_old and not new_alive:
         sys.exit("no server answered; conf2.json is left as it was")
 
-    addresses = {address for _, address in chosen if address}
+    addresses = {address for _, address, _ in kept_old + new_alive if address}
     countries = country_codes(sorted(addresses))
     log(f"country found for {len(countries)} of {len(addresses)} addresses")
-    chosen = spread(chosen, countries)
-    kept = [rename(link, title_of(countries.get(address))) for link, address in chosen]
 
     bad = bad_keys()
-    if bad:
-        before = len(kept)
-        kept = [link for link in kept if server_key(link) not in bad]
-        log(f"{before - len(kept)} servers left out: most accounts could not connect to them")
+    skipped = 0
+
+    def candidates(alive):
+        nonlocal skipped
+        out = []
+        for link, address, ms in alive:
+            country = countries.get(address)
+            renamed = rename(link, title_of(country))
+            if bad and server_key(renamed) in bad:
+                skipped += 1
+                continue
+            out.append((renamed, address, country, ms))
+        return out
+
+    keepers = candidates(kept_old)
+    fresh = candidates(new_alive)
+    if skipped:
+        log(f"{skipped} servers left out: most accounts could not connect to them")
+
+    chosen = select_and_mix(keepers, fresh, TARGET_COUNT)
+    kept = [link for link, _, _, _ in chosen]
     if not kept:
         sys.exit("every server was left out; conf2.json is left as it was")
+    kept_keys = {key_of(link) for link in kept}
+    stayed = sum(1 for link in previous if key_of(link) in kept_keys)
+    added = len(kept) - stayed
+    log(f"{len(kept)} configs: {stayed} kept from the last run, {added} new, {len(previous) - stayed} of the last run gone")
 
-    previous = []
-    if OUTPUT.exists():
-        try:
-            previous = json.loads(OUTPUT.read_text(encoding="utf-8")).get("configs", [])
-        except Exception:
-            previous = []
-    if previous == kept:
-        log("nothing changed")
-        return
     document = {
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "count": len(kept),
+        "kept": stayed,
+        "added": added,
         "configs": kept,
     }
-    # ensure_ascii off, so names in any language stay readable to the app (it undoes no \u escapes)
+    # ensure_ascii off, so names in any language stay readable to the app (it undoes no \\u escapes)
     OUTPUT.write_text(json.dumps(document, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     log(f"wrote {len(kept)} configs to {OUTPUT}")
 
