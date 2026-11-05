@@ -15,6 +15,7 @@ Settings come from environment variables, all optional:
   MAX_PER_SUB    most links kept from one subscription       (100)
   INCLUDE_UDP    keep hysteria2/hy2/wireguard links, which a TCP test cannot check (false)
   GEO_API_URL    batch address-to-country service            (http://ip-api.com/batch?fields=status,countryCode,query)
+  V2GET_API_URL, V2GET_ADMIN_SECRET   the panel; servers most accounts could not connect to are left out (skipped when unset)
   GEO_DB_URL     fallback table of address ranges, .csv or .csv.gz (db-ip.com's free country file of this month)
 
 Each kept link is renamed to the flag and the Persian name of the country its server is in, whatever name it had.
@@ -24,6 +25,7 @@ import base64
 import binascii
 import bisect
 import gzip
+import hashlib
 import ipaddress
 import json
 import os
@@ -318,6 +320,29 @@ def rename(link, title):
     return link.split("#", 1)[0] + "#" + urllib.parse.quote(title, safe="")
 
 
+def server_key(link):
+    """The key the app and the panel know a server by: the first 12 hex digits of the SHA-256 of its link."""
+    return hashlib.sha256(link.encode("utf-8")).hexdigest()[:12]
+
+
+def bad_keys():
+    """Keys of the servers that most accounts could not connect to, from the panel; empty when it cannot be asked."""
+    api = os.environ.get("V2GET_API_URL", "").strip().rstrip("/")
+    secret = os.environ.get("V2GET_ADMIN_SECRET", "").strip()
+    if not api or not secret:
+        return set()
+    try:
+        request = urllib.request.Request(
+            api + "/api/v1/servers/bad",
+            headers={"X-Admin-Secret": secret, "User-Agent": "Mozilla/5.0 (conf2-builder)"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return set(json.loads(response.read().decode()).get("bad", []))
+    except Exception as error:
+        log(f"! bad-server list not read: {error}")
+        return set()
+
+
 def read_subs():
     if not SUBS_FILE.exists():
         sys.exit(f"{SUBS_FILE} not found")
@@ -385,6 +410,14 @@ def main():
     countries = country_codes(sorted(addresses))
     log(f"country found for {len(countries)} of {len(addresses)} addresses")
     kept = [rename(link, title_of(countries.get(address))) for link, address in chosen]
+
+    bad = bad_keys()
+    if bad:
+        before = len(kept)
+        kept = [link for link in kept if server_key(link) not in bad]
+        log(f"{before - len(kept)} servers left out: most accounts could not connect to them")
+    if not kept:
+        sys.exit("every server was left out; conf2.json is left as it was")
 
     previous = []
     if OUTPUT.exists():
